@@ -1,5 +1,110 @@
 import Foundation
 
+/// Persist the outcome independently of the HTTP reply/watchdog. A client
+/// queries the same ID after a timeout; duplicate IDs never dispatch twice.
+final class OperationLedger {
+    enum Admission {
+        case accepted
+        case existing([String: JSONValue])
+        case rejected(JSONRPCError)
+    }
+    private struct Receipt: Codable {
+        var client: String
+        var id: String
+        var method: String
+        var params: [String: JSONValue]
+        var state: String
+        var updated: Double
+        var result: [String: JSONValue]?
+        var error: [String: JSONValue]?
+    }
+    private let lock = NSLock()
+    private let url: URL
+    private var receipts: [String: Receipt] = [:]
+    private var storageError = false
+    let session = UUID().uuidString
+
+    init(url: URL) {
+        self.url = url
+        do {
+            if FileManager.default.fileExists(atPath: url.path) {
+                receipts = try JSONDecoder().decode([String: Receipt].self, from: Data(contentsOf: url))
+                for key in Array(receipts.keys) where ["queued", "running"].contains(receipts[key]!.state) {
+                    receipts[key]!.state = "unknown_after_restart"
+                }
+                try save()
+            }
+        } catch { storageError = true }
+    }
+
+    private func save() throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try JSONEncoder().encode(receipts).write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    private func value(_ receipt: Receipt) -> [String: JSONValue] {
+        var out: [String: JSONValue] = ["operation_id": .string(receipt.id), "method": .string(receipt.method),
+            "state": .string(receipt.state), "server_session": .string(session)]
+        if let result = receipt.result { out["result"] = .object(result) }
+        if let error = receipt.error { out["error"] = .object(error) }
+        return out
+    }
+
+    func status(client: String, id: String) -> [String: JSONValue] {
+        lock.lock(); defer { lock.unlock() }
+        if storageError { return ["operation_id": .string(id), "state": .string("storage_unavailable")] }
+        guard let receipt = receipts[client + ":" + id] else {
+            return ["operation_id": .string(id), "state": .string("not_found"), "server_session": .string(session)]
+        }
+        return value(receipt)
+    }
+
+    func begin(client: String, id: String, method: String, params: [String: JSONValue]) -> Admission {
+        lock.lock(); defer { lock.unlock() }
+        guard !storageError, !client.isEmpty, id.range(of: "^[A-Za-z0-9_-]{16,80}$", options: .regularExpression) != nil else {
+            return .rejected(.invalidParams)
+        }
+        let key = client + ":" + id
+        if let old = receipts[key] {
+            guard old.method == method && old.params == params else { return .rejected(.invalidParams) }
+            return .existing(value(old))
+        }
+        // Never silently evict an ID and accidentally allow its replay.
+        guard receipts.count < 50_000 else { return .rejected(.serverError("Operation receipt store is full; no action dispatched.")) }
+        receipts[key] = Receipt(client: client, id: id, method: method, params: params,
+            state: "queued", updated: Date().timeIntervalSince1970)
+        do { try save(); return .accepted }
+        catch { receipts.removeValue(forKey: key); storageError = true; return .rejected(.internalError) }
+    }
+
+    func running(client: String, id: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let key = client + ":" + id
+        guard !storageError, receipts[key]?.state == "queued" else { return false }
+        receipts[key]!.state = "running"
+        do { try save(); return true } catch { storageError = true; return false }
+    }
+
+    func finish(client: String, id: String, result: [String: JSONValue]?, error: JSONRPCError?) {
+        lock.lock(); defer { lock.unlock() }
+        let key = client + ":" + id
+        guard receipts[key] != nil else { return }
+        receipts[key]!.state = error == nil ? "succeeded" : "failed"
+        receipts[key]!.result = result
+        receipts[key]!.error = error.map { ["code": .int($0.code), "message": .string($0.message)] }
+        receipts[key]!.updated = Date().timeIntervalSince1970
+        // Retain ID tombstones permanently; only old response payloads expire.
+        let full = receipts.filter { $0.value.result != nil || $0.value.error != nil }.sorted { $0.value.updated > $1.value.updated }
+        for (oldKey, _) in full.dropFirst(512) {
+            receipts[oldKey]!.result = nil; receipts[oldKey]!.error = nil
+            receipts[oldKey]!.state = "completed_result_expired"
+        }
+        do { try save() } catch { storageError = true }
+    }
+}
+
 // MARK: - JSON-RPC 2.0 Types
 
 struct JSONRPCRequest: Codable {

@@ -16,6 +16,10 @@ struct RPCMethodDef: Encodable {
 
 struct RPCMethodRegistry {
     static let methods: [RPCMethodDef] = [
+        RPCMethodDef(name: "operation_status",
+            description: "Query a durable action receipt by operation_id without entering the UI queue. Send _operation_id (unique 16-80 ASCII letters, digits, underscore or hyphen) with an action to record it before dispatch. Reusing the ID never executes the action twice; parameters must match. Query after any timeout, never resend the action. Receipts are isolated by authenticated client. A restarted in-flight operation is unknown_after_restart and must be reconciled with the actual UI, never replayed.",
+            params: [RPCParamDef(name: "operation_id", type: "string", required: true, description: "The original action ID")],
+            returns: "{operation_id, method?, state: not_found|queued|running|succeeded|failed|unknown_after_restart|completed_result_expired|storage_unavailable, result?, error?, server_session?}"),
         RPCMethodDef(
             name: "config",
             description: "Read or update server settings and manage authorized sessions. With no params: returns current config plus the list of authorized sessions (client name, masked token prefix, granted/expiry times). Pass allow_remote_access and/or listen_port to change settings (persisted; server restarts, dropping the connection — reconnect at the returned address). Pass revoke_session_id to remove one session, or clear_sessions=true to revoke ALL tokens (including your own). Pass stop_server=true to SHUT DOWN the service (stops listening after replying; re-launch the runner to restart — tokens are preserved so no re-auth is needed).",
@@ -268,6 +272,7 @@ struct RPCMethodRegistry {
             description: "Open an app by bundle identifier (non-blocking, via LSApplicationWorkspace). If you don't know the bundle_id, use resolve_app to find it (e.g. 'Maps' → com.apple.Maps). There is no target app: every read and action applies to whatever is on screen, so if the app later jumps elsewhere, read the screen and decide. The app may still be drawing its first screen when this returns: read right away, and if you see a splash/placeholder, read again (poll ~0.5s, capped) — don't sleep a fixed time.",
             params: [
                 RPCParamDef(name: "bundle_id", type: "string", required: true, description: "App bundle identifier (from resolve_app)"),
+                RPCParamDef(name: "launch_mode", type: "string", required: false, description: "ready (default) watches the first draw; foreground returns after foreground switching and alert checks, without visual settling. Read page_source before acting; it may still be loading."),
             ],
             returns: "{message, hint}"
         ),
@@ -395,6 +400,7 @@ struct RPCMethodRegistry {
     /// call (no separate /schema fetch needed). Keep in sync with what the server
     /// actually implements.
     static let capabilityTags: [String] = [
+        "operation_receipts",  // authenticated, durable, no action replay after HTTP timeouts
         "envelope_v1",         // /pair + encrypted /rpc envelopes (HMAC-SHA256)
         "stream_ticket",       // stream_ticket RPC → single-use ?ticket= for /stream + /logs
         "video_stream",        // GET /stream (H.264-in-MPEG-TS live screen)

@@ -46,6 +46,7 @@ struct ActionCommand {
     var enhanced: Bool?
     var source: String?
     var settleTimeout: Double?
+    var launchMode: String?
 
     init(method: String, params: [String: JSONValue]?) {
         self.name = method
@@ -82,6 +83,7 @@ struct ActionCommand {
         self.enhanced = params?["enhanced"]?.boolValue
         self.source = params?["source"]?.stringValue
         self.settleTimeout = params?["settle_timeout"]?.doubleValue
+        self.launchMode = params?["launch_mode"]?.stringValue
 
         self.maxDepth = params?["max_depth"]?.intValue
         self.maxElements = params?["max_elements"]?.intValue

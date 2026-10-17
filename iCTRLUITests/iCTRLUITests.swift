@@ -4,6 +4,8 @@ import UIKit
 import Network
 
 final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
+    private let operations = OperationLedger(url: FileManager.default.urls(for: .applicationSupportDirectory,
+        in: .userDomainMask)[0].appendingPathComponent("iCTRL/operation-receipts.json"))
     private var server: JSONRPCServer?
     private var app: XCUIApplication!
     private var actionHandler: ActionHandler?
@@ -1178,6 +1180,31 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                 completion(nil, .internalError)
                 return
             }
+            let operationID = params?["_operation_id"]?.stringValue
+            let operationClient = params?["__operation_client"]?.stringValue ?? ""
+            var actionParams = params ?? [:]
+            actionParams.removeValue(forKey: "_operation_id")
+            actionParams.removeValue(forKey: "__operation_client")
+            if method == "operation_status" {
+                guard let id = params?["operation_id"]?.stringValue, !operationClient.isEmpty else {
+                    completion(nil, .invalidParams); return
+                }
+                completion(self.operations.status(client: operationClient, id: id), nil)
+                return
+            }
+            if let id = operationID {
+                switch self.operations.begin(client: operationClient, id: id, method: method, params: actionParams) {
+                case .accepted: break
+                case .rejected(let error): completion(nil, error); return
+                case .existing(let receipt):
+                    if receipt["state"]?.stringValue == "succeeded", let result = receipt["result"]?.objectValue {
+                        completion(result, nil)
+                    } else {
+                        completion(nil, JSONRPCError(code: -32000, message: "Operation already recorded; query operation_status. Never redispatch it.", data: receipt))
+                    }
+                    return
+                }
+            }
 
             // Run the work on the serial RPC queue with a watchdog timeout so a
             // hung call reports back to the client instead of stalling forever.
@@ -1211,7 +1238,9 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             // better than a client blocking for minutes.
             if isUIMethod, let tripped = self.uiBreakerMessage() {
                 Self.logBuffer.append("⛔️ \(method) rejected — UI channel unhealthy")
-                completion(nil, .serverError(tripped))
+                let error = JSONRPCError.serverError(tripped)
+                if let id = operationID { self.operations.finish(client: operationClient, id: id, result: nil, error: error) }
+                completion(nil, error)
                 return
             }
 
@@ -1227,6 +1256,9 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
             queue.async {
                 let start = ProcessInfo.processInfo.systemUptime
                 var result: ([String: JSONValue]?, JSONRPCError?) = (nil, .internalError)
+                if let id = operationID, !self.operations.running(client: operationClient, id: id) {
+                    done.signal(); replyOnce((nil, .internalError)); return
+                }
                 started.set(true)
                 if isUIMethod { self.setUIInFlight(method) }
 
@@ -1247,7 +1279,7 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                         result = self.handleConfig(params)
                     } else if let handler = self.actionHandler {
                         let reason = ObjCException.catching {
-                            result = handler.dispatch(method: method, params: params)
+                            result = handler.dispatch(method: method, params: actionParams)
                         }
                         if let reason = reason {
                             result = (nil, .serverError(
@@ -1273,6 +1305,9 @@ final class iCTRLUITests: XCTestCase, UNUserNotificationCenterDelegate {
                 // Completing at all proves the UI channel is alive, even if the
                 // action itself failed (element not found is a healthy answer).
                 if isUIMethod { self.setUIInFlight(nil); self.noteUISuccess() }
+                if let id = operationID {
+                    self.operations.finish(client: operationClient, id: id, result: result.0, error: result.1)
+                }
                 if let err = result.1 { Self.logBuffer.append("← ERR \(method): \(err.message)") }
                 done.signal()
                 replyOnce(result)  // may be a no-op if the watchdog already replied

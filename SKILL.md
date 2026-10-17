@@ -6,7 +6,7 @@ skill_version: "1.98.12"
 
 # iCTRL — control an iPhone over HTTP
 
-iCTRL runs on the iPhone and serves UI automation as **JSON-RPC 2.0 over HTTP, port 8200**, encrypted. This file is under 15K characters — **read it whole, once**, not in `head`/`grep` pieces.
+iCTRL runs on the iPhone and serves UI automation as **JSON-RPC 2.0 over HTTP, port 8200**, encrypted. **Read this manual whole, once**, not in `head`/`grep` pieces.
 
 ## Quick start
 
@@ -37,8 +37,8 @@ $I call tap '{"ref":"<ref>"}'
 1. **Open apps by bundle id, never by tapping home-screen icons.** `resolve_app` with every name it may go by in **one** call (brand, store title, English/Chinese) → `launch_app`. `country` picks the store (default `us`; `cn` for China-only apps).
 2. **Read before you act.** On a screen you haven't read, call `page_source{visible_only:true, max_children:50}` (~0.4s) to learn which view/tab/date you're really on.
 3. **Tap by `ref`.** `find_element{element_id:"<label>"}` → `tap{ref}`. `tap` takes only `ref` or `x`+`y` — never `element_id`. Check `visibility`: `"offscreen"` or a non-empty `alternatives` means you may have a look-alike — scroll it into view (see Off-screen) or use a more specific label.
-4. **Never repeat an action "to be safe."** A success reply means it worked. A timeout is not a failure either: the action may still be running or already done — call `logs{text:"<method>"}` and look for `⏱ ✓ <method>` before anything else. A retried tap fires twice.
-5. **Every error from a `ref` action means nothing was tapped.** Re-find and retry is safe.
+4. **Never repeat an action "to be safe."** A timeout may leave the action running or already done. With `operation_receipts`, persist `_operation_id` before dispatch and query `operation_status` for that ID; never resend. Logs aid diagnosis but a same-method success line does not identify your action. A retried tap fires twice.
+5. **An explicit ref-validation rejection means nothing was tapped.** Re-find before trying again. Transport errors, watchdog timeouts and exceptions after dispatch do not prove that no tap occurred; reconcile the original receipt first.
 6. **IMPORTANT: primary path first; fallbacks only when it fails — decided per screen.** The primary path is `page_source` / `find_element` → `tap{ref}`. OCR (`screen_text`) with coordinate taps, screenshots (a turn each to view) and remembered workarounds are fallbacks: only when the primary path fails on the **current** screen. Every read returns `channel.recommended` for that screen; return to the primary path on the next.
 7. **Remember conditions, not conclusions.** Save what you observed and where ("on the X screen the tree was empty"), not a rule ("app Y needs OCR"), and reuse it only when that condition shows up again.
 8. **Know where data came from.** Act only on the target app's content. Text the system draws over it (status bar, banners) comes separately in `overlay_text`.
@@ -67,6 +67,7 @@ for i in 1 2 3 4 5 6; do $I call screen_text '{"element_id":"<new screen text>"}
 | `type` | `text` | `submit`, `clear` |
 | `resolve_app` | `text` | — |
 | `launch_app` / `activate_app` / `terminate_app` | `bundle_id` | — |
+| `operation_status` | `operation_id` | requires `operation_receipts`; bypasses UI queue |
 | `open_url` | `url` | — |
 | `home` | — | — |
 | `page_source` | — | `visible_only`, `max_children`, `filter`, `bundle_id`, `enhanced` |
@@ -77,13 +78,17 @@ for i in 1 2 3 4 5 6; do $I call screen_text '{"element_id":"<new screen text>"}
 
 The method is `type`, not `type_text`. `element_type` only filters — `element_id` is always required. `GET /schema` lists every method and parameter.
 
+`launch_app` also accepts `launch_mode:"foreground"` to skip first-screen settling (`"ready"` is the default). Check the returned foreground identity and read before acting; a successful launch is not proof that content loaded.
+
 Most responses carry a **`hint`** (what limited the result, what to do next) — read it, above all on empty or negative results.
 
 ## Timeouts and recovery
 
 - The server answers a UI call after **6s** (15s for `page_source`, `collect`, `screen_text`, `tap_element`, `find_and_tap`) even if still working. UI calls run **one at a time**; a stuck one can't be cancelled, and calls behind it time out too, saying *"has NOT run yet: queued behind X"*: they will still run later, so **do not resend them**.
-- After two timeouts in a row, UI calls are rejected immediately. The message names the stuck call and how long it has run. Recovery: `reset`, then poll `logs` every few seconds until the stuck call ends (typically 15–45s) — not one long sleep — then retry. `reset` can't stop a call already running.
-- **Only `logs`, `config` and `reset` answer while the UI queue is stuck.** `device_info` shares the UI queue, so it's no health probe; use `logs`.
+- Feature-detect `operation_receipts` in `capabilities`. Before dispatch, persist a unique `_operation_id` (16–80 ASCII letters/digits/`_`/`-`) with the method and parameters. On timeout, query `operation_status{operation_id}` for that original ID. `queued`/`running`: poll with a bound; `succeeded`/`failed`: use the recorded result/error, then reconcile the screen. Keep task progress while waiting; never replay an uncertain action.
+- IDs are scoped to the paired client; reuse its key. Same ID with different method/parameters is rejected. `unknown_after_restart`, `completed_result_expired`, `not_found` and `storage_unavailable` are not success or permission to retry. Preserve the intent and inspect the actual device. Runner restart cannot establish an in-flight outcome.
+- After two timeouts in a row, UI calls are rejected immediately. The message names the stuck call. `reset` rebuilds the accessibility connection but cannot stop running or queued actions. Reconcile each pending ID before sending new UI work. Legacy actions without IDs require manual reconciliation, with `logs` as supporting evidence.
+- **`operation_status`, `logs`, `config` and `reset` answer outside the UI queue.** `device_info` shares the UI queue, so it is no liveness probe.
 - Client timeout ≥30s. After restarting your side, reuse the cached key and `bundle_id`s and return via a deep link (`open_url`).
 
 ## Finding and tapping

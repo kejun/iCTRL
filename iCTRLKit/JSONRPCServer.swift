@@ -1076,6 +1076,13 @@ class JSONRPCServer {
 
         let method = rpcRequest.method
         var params = rpcRequest.params
+        // Operation receipts belong to the authenticated client, never to a
+        // caller-supplied identity. Used only inside the runner callback.
+        if method == "operation_status" || params?["_operation_id"] != nil {
+            var p = params ?? [:]
+            p["__operation_client"] = .string(opened.tokId)
+            params = p
+        }
         // `config` may widen who can reach the device (nearby discovery), which
         // only a caller on this device may do. Tell it where this request came
         // from; set here, after authentication, and overwriting any value the

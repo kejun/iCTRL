@@ -2930,6 +2930,11 @@ class ActionHandler {
         guard let bundleId = cmd.bundleId else {
             return (nil, JSONRPCError(code: -32602, message: "launch_app requires a 'bundle_id' (e.g. 'com.apple.Preferences', 'ctrip.com')", data: nil))
         }
+        let launchMode = cmd.launchMode ?? "ready"
+        guard launchMode == "ready" || launchMode == "foreground" else {
+            return (nil, JSONRPCError(code: -32602, message: "launch_mode must be ready or foreground", data: nil))
+        }
+        let foregroundOnly = launchMode == "foreground"
         // Open via LSApplicationWorkspace (same as WebDriverAgent): this is
         // NON-BLOCKING and returns immediately — no quiescence wait, so a wrong
         // bundle_id or an ad/launch screen can't hang the whole server (which is
@@ -2952,7 +2957,7 @@ class ActionHandler {
             return false
         }()
         let preAt = nowMonotonic
-        let startFrame = ScreenSettle.sample()
+        let startFrame = foregroundOnly ? nil : ScreenSettle.sample()
         let captureCost = nowMonotonic - preAt
         let opened = ForegroundApp.openBundleID(bundleId)
         guard opened else {
@@ -2984,7 +2989,7 @@ class ActionHandler {
                 usleep(100_000)
                 polls += 1
                 let pid = ForegroundApp.frontmostPID()
-                if pid > 0 && pid != before {
+                if pid > 0 && pid != before && pid != springboardPID {
                     // The process that just came up is the one launched: naming
                     // it by asking XCTest for each app's state right after a
                     // launch can block for seconds ("Unable to update application
@@ -3013,7 +3018,7 @@ class ActionHandler {
         // Not when a capture is slow: then the screen itself is (a hot phone,
         // a heavy app starting, where one capture can take seconds), and watching
         // it only makes launch_app overrun. The caller reads next anyway.
-        let drawn: ScreenSettle.Outcome? = captureCost > 0.35 ? nil :
+        let drawn: ScreenSettle.Outcome? = foregroundOnly || captureCost > 0.35 ? nil :
             ScreenSettle.wait(baseline: startFrame, budget: max(0.3, min(1.5, launchStart + 3.8 - nowMonotonic)))
         if let last = drawn?.last { noteSeen(last) }
         let settledAt = nowMonotonic
@@ -3057,8 +3062,12 @@ class ActionHandler {
                 total * 1000, preMs, captureCost * 1000, (openedAt - preAt - captureCost) * 1000, (frontAt - openedAt) * 1000,
                 (settledAt - frontAt) * 1000, (resolvedAt - settledAt) * 1000, alertMs))
         }
-        var data: [String: JSONValue] = ["message": .string("Opened \(bundleId)."), "settle": drawn?.json ??
+        var data: [String: JSONValue] = ["message": .string("Opened \(bundleId)."), "launch_mode": .string(launchMode),
+            "foreground_confirmed": .bool(front == bundleId), "settle": drawn?.json ??
             .object(["skipped": .string("screen captures are slow right now (\(Int(captureCost * 1000))ms), so the launch wasn't watched")])]
+        if foregroundOnly {
+            data["settle"] = .object(["skipped": .string("foreground mode: read the screen before acting"), "stable": .bool(false)])
+        }
         if let front = front { data["foreground_app"] = .string(front) }
         if front == bundleId {
             // No fixed delay: on current devices apps are usually drawn almost

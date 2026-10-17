@@ -625,6 +625,60 @@ every request slides that window forward, so a key in regular use never expires.
 the version wasn't bumped), and a `capabilities` array. Feature-detect against
 `capabilities` rather than comparing versions.
 
+### Durable operation receipts
+
+When `capabilities` includes `operation_receipts`, persist a unique operation ID
+and its method/parameters on the client before sending an action. Add
+`_operation_id` to its parameters (16–80 ASCII letters, digits, `_` or `-`):
+
+```json
+{"method":"page","params":{"direction":"up","_operation_id":"operation_example_001"}}
+```
+
+After a timeout or lost reply, query the original ID with an authenticated RPC:
+
+```json
+{"method":"operation_status","params":{"operation_id":"operation_example_001"}}
+```
+
+`operation_status` bypasses the UI queue. The runner records an action before
+dispatch and records its outcome independently of the HTTP watchdog. Reusing
+the same ID never dispatches another action: identical successful requests
+return the cached result; other recorded states return the receipt in the
+error's `data`. Changing the method or parameters with an existing ID is
+rejected. IDs are scoped to the authenticated client; `__operation_client` is
+an internal, server-injected value, not a client-selectable identity.
+
+| Receipt state | Client behavior |
+|---|---|
+| `queued`, `running` | Poll the same ID; do not send another action. |
+| `succeeded`, `failed` | Use `result` or `error`, then reconcile the current screen before continuing. |
+| `unknown_after_restart` | The runner restarted before recording an outcome. Reconcile the actual device; never replay automatically. |
+| `completed_result_expired` | Execution ended, but the response payload expired. This is not proof of success. |
+| `not_found`, `storage_unavailable` | No reliable outcome is available. Diagnose and preserve the pending intent; do not infer that retrying is safe. |
+
+Receipts live in the runner sandbox at
+`Library/Application Support/iCTRL/operation-receipts.json` (directory 0700,
+file 0600). The latest 512 response payloads are retained; older IDs remain as
+tombstones to prevent replay. At 50,000 IDs, new recorded actions are refused
+rather than evicting IDs. Preserve this file when investigating pending work.
+A crash between the external action and saving its result can still leave an
+unknown outcome; receipts do not make external UI actions transactional.
+
+An HTTP timeout does not cancel XCTest. Wait for the original receipt, preserve
+task progress when the outcome is unknown, and continue only after reconciliation.
+Logs help diagnosis but a same-method success line is not proof for a particular
+operation. Legacy clients without IDs must reconcile manually. `reset` rebuilds
+the accessibility connection; it cannot stop a running action or erase its intent.
+
+### Foreground launch mode
+
+`launch_app` accepts `launch_mode:"ready"` (default) or `"foreground"`.
+Foreground mode checks the foreground switch and launch alerts, then returns
+without watching the first screen settle. Read `page_source` before acting;
+if the screen is loading, use bounded reads. Check `foreground_confirmed` and
+`foreground_app`; SpringBoard is not confirmation that the target app launched.
+
 ## Building
 
 From a fresh clone, with Xcode signed in to an Apple ID (Settings → Accounts —
@@ -657,6 +711,34 @@ runner:
 To publish a build, run `Scripts/package-release.sh`. It writes `release/` copies
 stripped of your provisioning profile (your name, team id and device UDIDs) and
 ad-hoc signed. Whoever installs them re-signs anyway.
+
+For a connected development device, after signing setup and project generation:
+
+```bash
+xcodebuild build-for-testing -project iCTRL.xcodeproj -scheme iCTRL \
+  -derivedDataPath build -destination 'generic/platform=iOS' \
+  -allowProvisioningUpdates ARCHS=arm64
+xcodebuild test-without-building -project iCTRL.xcodeproj -scheme iCTRL \
+  -derivedDataPath build -destination 'id=<device-UDID>' -allowProvisioningUpdates
+```
+
+Keep one runner test session per phone. Deploying a client update does not
+update the installed runner; verify `operation_receipts` on the deployed build.
+
+The receipt checks run locally on macOS without a device:
+
+```bash
+swiftc iCTRLKit/RPCTypes.swift iCTRLKit/AuthManager.swift \
+  iCTRLKit/SecureEnvelope.swift iCTRLKit/TokenFileStore.swift \
+  iCTRLKit/KeychainStore.swift Scripts/test-operation-ledger.swift \
+  -o /private/tmp/ictrl-ledger-test
+/private/tmp/ictrl-ledger-test
+```
+
+These check persistence, duplicate suppression, authenticated-client isolation,
+parameter binding and restart ambiguity. The iOS build and a real-device timeout
+recovery were also verified: one page action exceeded the 6-second watchdog,
+finished at 7.274 seconds, and was recovered by its original ID without replay.
 
 ## Project layout
 
